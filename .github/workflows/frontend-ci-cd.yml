@@ -1,0 +1,204 @@
+name: frontend-ci-cd
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.ts"
+      - "tsconfig*.json"
+  push:
+    branches: [feature/pipeline, main]
+
+env:
+  NODE_VERSION: "20"
+  IMAGE_NAME: frontend
+  REGISTRY: ghcr.io
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_TASK_DEFINITION: ${{ secrets.ECS_TASK_DEFINITION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  DORA_METRICS_REPO: ${{ github.repository_owner }}/dora-metrics
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # - name: Lint
+      #   run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test (if present)
+        run: npm run test --if-present
+
+      - name: Upload dist
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vite-dist
+          path: dist
+
+  deploy:
+    needs: containerize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set lowercase repository name
+        id: repo-name
+        run: |
+          echo "repo_owner_lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "repo_name_lower=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS task definition
+        id: task-def
+        run: |
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task_arn=$NEW_TASK_ARN" >> $GITHUB_OUTPUT
+          echo "✅ New task definition: $NEW_TASK_ARN"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition ${{ steps.task-def.outputs.task_arn }} \
+            --force-new-deployment
+
+          echo "✅ ECS service updated with new task definition"
+          echo "🚀 Deployment initiated for image: ${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest"
+
+  containerize:
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/pipeline'
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        id: build-image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_URI=${{ env.REGISTRY }}/$OWNER/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker build -t $IMAGE_URI .
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Push Docker image to GHCR
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker push ${{ env.REGISTRY }}/$OWNER/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/$OWNER/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/$OWNER/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/$OWNER/${{ env.IMAGE_NAME }}:latest
+          echo "✅ Pushed tags: ${{ github.sha }} and latest"
+
+      - name: Init DORA CSV
+        if: always()
+        run: echo "service,event,status,commit,timestamp" > dora_events.csv
+
+      - name: Record DORA event (deploy success)
+        if: success()
+        run: printf "frontend,deploy,success,${{ github.sha }},$(date -Iseconds)\n" >> dora_events.csv
+
+      - name: Record DORA event (deploy fail)
+        if: failure()
+        run: printf "frontend,deploy,fail,${{ github.sha }},$(date -Iseconds)\n" >> dora_events.csv
+
+      - name: Send DORA event to dora-metrics (success)
+        if: success()
+        env:
+          DORA_TOKEN: ${{ secrets.DORA_METRICS_TOKEN }}
+        run: |
+          if [ -z "$DORA_TOKEN" ]; then
+            echo "DORA_METRICS_TOKEN not set; skipping push";
+            exit 0;
+          fi
+          payload=$(jq -n \
+            --arg service "frontend" \
+            --arg status "success" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg ts "$(date -Iseconds)" \
+            '{event_type:"dora-event", client_payload:{service:$service,status:$status,commit:$commit,repo:$repo,timestamp:$ts}}')
+          curl -s -X POST \
+            -H "Authorization: token $DORA_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ env.DORA_METRICS_REPO }}/dispatches \
+            -d "$payload"
+
+      - name: Send DORA event to dora-metrics (fail)
+        if: failure()
+        env:
+          DORA_TOKEN: ${{ secrets.DORA_METRICS_TOKEN }}
+        run: |
+          if [ -z "$DORA_TOKEN" ]; then
+            echo "DORA_METRICS_TOKEN not set; skipping push";
+            exit 0;
+          fi
+          payload=$(jq -n \
+            --arg service "frontend" \
+            --arg status "fail" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg repo "${GITHUB_REPOSITORY}" \
+            --arg ts "$(date -Iseconds)" \
+            '{event_type:"dora-event", client_payload:{service:$service,status:$status,commit:$commit,repo:$repo,timestamp:$ts}}')
+          curl -s -X POST \
+            -H "Authorization: token $DORA_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ env.DORA_METRICS_REPO }}/dispatches \
+            -d "$payload"
+
+      - name: Upload DORA CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-events-frontend
+          path: dora_events.csv
