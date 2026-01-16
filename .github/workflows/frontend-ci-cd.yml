@@ -14,7 +14,7 @@ on:
 
 env:
   NODE_VERSION: "20"
-  IMAGE_NAME: frontend
+  IMAGE_NAME: irent-frontend
   REGISTRY: ghcr.io
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
@@ -176,12 +176,12 @@ jobs:
         id: task-def
         run: |
           TASK_DEFINITION=$(aws ecs describe-task-definition \
-            --task-definition irent-backend-frontend-task \
+            --task-definition irent-frontend-task \
             --query 'taskDefinition' \
             --output json)
 
           NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" \
-            '(.containerDefinitions[] | select(.name == "irent-backend-frontend") | .image) |= $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+            '(.containerDefinitions[] | select(.name == "irent-frontend") | .image) |= $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
           NEW_TASK_ARN=$(aws ecs register-task-definition \
             --cli-input-json "$NEW_TASK_DEF" \
@@ -194,8 +194,8 @@ jobs:
       - name: Update ECS service
         run: |
           aws ecs update-service \
-            --cluster irent-backend-cluster \
-            --service irent-backend-frontend-service \
+            --cluster irent-cluster \
+            --service irent-frontend-service \
             --task-definition ${{ steps.task-def.outputs.task_arn }} \
             --force-new-deployment
 
