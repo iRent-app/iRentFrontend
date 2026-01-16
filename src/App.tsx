@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
+import { Routes, Route, Link } from 'react-router-dom';
 
 import './App.css';
 
@@ -12,7 +12,6 @@ import CarDetails from './components/CarDetails';
 
 // Main branch pages
 import AuthPage from './AuthPage';
-import HomePage from './HomePage';
 import OwnerDashboard from './OwnerDashboard';
 import MyCars from './MyCars';
 import AddCarBasic from './AddCarBasic';
