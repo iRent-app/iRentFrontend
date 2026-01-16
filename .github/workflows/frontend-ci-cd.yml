@@ -54,60 +54,8 @@ jobs:
           name: vite-dist
           path: dist
 
-  deploy:
-    needs: containerize
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set lowercase repository name
-        id: repo-name
-        run: |
-          echo "repo_owner_lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
-          echo "repo_name_lower=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Update ECS task definition
-        id: task-def
-        run: |
-          TASK_DEFINITION=$(aws ecs describe-task-definition \
-            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
-            --query 'taskDefinition' \
-            --output json)
-
-          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest" \
-            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
-
-          NEW_TASK_ARN=$(aws ecs register-task-definition \
-            --cli-input-json "$NEW_TASK_DEF" \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "task_arn=$NEW_TASK_ARN" >> $GITHUB_OUTPUT
-          echo "✅ New task definition: $NEW_TASK_ARN"
-
-      - name: Update ECS service
-        run: |
-          aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition ${{ steps.task-def.outputs.task_arn }} \
-            --force-new-deployment
-
-          echo "✅ ECS service updated with new task definition"
-          echo "🚀 Deployment initiated for image: ${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest"
-
   containerize:
     needs: build-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feature/pipeline'
     outputs:
       image_uri: ${{ steps.build-image.outputs.image_uri }}
     runs-on: ubuntu-latest
@@ -202,3 +150,54 @@ jobs:
         with:
           name: dora-events-frontend
           path: dora_events.csv
+
+  deploy:
+    needs: containerize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set lowercase repository name
+        id: repo-name
+        run: |
+          echo "repo_owner_lower=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "repo_name_lower=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update ECS task definition
+        id: task-def
+        run: |
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task_arn=$NEW_TASK_ARN" >> $GITHUB_OUTPUT
+          echo "✅ New task definition: $NEW_TASK_ARN"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition ${{ steps.task-def.outputs.task_arn }} \
+            --force-new-deployment
+
+          echo "✅ ECS service updated with new task definition"
+          echo "🚀 Deployment initiated for image: ${{ env.REGISTRY }}/${{ steps.repo-name.outputs.repo_owner_lower }}/${{ steps.repo-name.outputs.repo_name_lower }}:latest"
